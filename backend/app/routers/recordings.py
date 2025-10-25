@@ -98,7 +98,8 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
             finally:
                 db3.close()
         finally:
-            _recorders.pop(room_id, None)
+            # keep registry entry until explicit stop to allow client to fetch status/stop
+            pass
 
     task = asyncio.create_task(run())
     _recorders[room_id] = (task, rr, rec_id)
@@ -120,8 +121,11 @@ async def stop_recording(room_id: str, db: Session = Depends(get_db), authorizat
     except Exception:
         # stopping is best-effort
         logger.exception("recording.stop_error room_id=%s recording_id=%s", room_id, rec_id)
-    await task
+    if task and not task.done():
+        await task
     rec = db.get(Recording, rec_id)
+    # cleanup registry entry after stop completes
+    _recorders.pop(room_id, None)
     return {"status": rec.status.value if rec else "unknown", "recording_id": rec_id, "url": rec.public_url if rec else None}
 
 
