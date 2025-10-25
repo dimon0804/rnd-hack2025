@@ -53,8 +53,9 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
     db.refresh(rec)
     rec_id = str(rec.id)
 
-    # use owner's token to connect recorder as a participant
-    service_token = create_access_token(str(me.id), extra={"display_name": me.display_name})
+    # issue a special service token for recorder to avoid affecting UI/participants
+    service_sub = f"recorder:{room_id}"
+    service_token = create_access_token(service_sub, extra={"display_name": "Recorder", "recorder": True})
     # create initial recorder instance and store reference for stop/status
     rr = RoomRecorder(room_id, service_token)
     _recorders[room_id] = (None, rr, str(rec.id))  # type: ignore

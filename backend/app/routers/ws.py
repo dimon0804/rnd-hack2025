@@ -37,7 +37,15 @@ class RoomHub:
         for c in list(self.rooms.get(room_key, [])):
             if skip_conn is not None and c is skip_conn:
                 continue
-            await c.ws.send_json(message)
+            try:
+                await c.ws.send_json(message)
+            except Exception:
+                # drop dead connections silently
+                conns = self.rooms.get(room_key, [])
+                if c in conns:
+                    conns.remove(c)
+                if not conns:
+                    self.rooms.pop(room_key, None)
 
     def find_by_conn_id(self, room_key: str, conn_id: str) -> Connection | None:
         for c in self.rooms.get(room_key, []):
@@ -55,6 +63,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
         payload = decode_token(token)
         user_id = payload.get("sub")
         display_name = payload.get("display_name")
+        is_recorder = bool(payload.get("recorder")) or (isinstance(user_id, str) and user_id.startswith("recorder:"))
     except Exception:
         await websocket.close(code=4401)
         return
@@ -63,37 +72,39 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     conn = Connection(websocket, user_id, display_name)
     await hub.connect(room_key, conn)
 
-    # Mark participant as connected in DB
-    db = SessionLocal()
-    try:
-        # ensure participant row exists
-        p = db.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
-        if not p:
-            p = Participant(room_id=room_id, user_id=user_id)
-            db.add(p)
-        p.connected = True
-        db.commit()
-        # start call log
-        cl = CallLog(room_id=room_id, user_id=user_id)
-        db.add(cl)
-        db.commit()
-        db.refresh(cl)
-        hub.active_logs[(room_id, user_id)] = str(cl.id)
-    finally:
-        db.close()
+    # Mark participant as connected in DB (skip for recorder)
+    if not is_recorder:
+        db = SessionLocal()
+        try:
+            # ensure participant row exists
+            p = db.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
+            if not p:
+                p = Participant(room_id=room_id, user_id=user_id)
+                db.add(p)
+            p.connected = True
+            db.commit()
+            # start call log
+            cl = CallLog(room_id=room_id, user_id=user_id)
+            db.add(cl)
+            db.commit()
+            db.refresh(cl)
+            hub.active_logs[(room_id, user_id)] = str(cl.id)
+        finally:
+            db.close()
 
     # send welcome with own conn_id
     await conn.ws.send_json({"type": "welcome", "conn_id": conn.conn_id})
     # send current peers to newcomer
     current = [
         {"user_id": c.user_id, "conn_id": c.conn_id, "display_name": c.display_name}
-        for c in hub.rooms.get(room_key, []) if c is not conn
+        for c in hub.rooms.get(room_key, []) if c is not conn and not (isinstance(c.user_id, str) and c.user_id.startswith("recorder:"))
     ]
     if current:
         await conn.ws.send_json({"type": "peers", "items": current})
-    # notify others
-    await hub.broadcast(room_key, {"type": "join", "user_id": user_id, "display_name": display_name, "conn_id": conn.conn_id}, skip_conn=conn)
-    await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, "connected": True})
+    # notify others (skip for recorder)
+    if not is_recorder:
+        await hub.broadcast(room_key, {"type": "join", "user_id": user_id, "display_name": display_name, "conn_id": conn.conn_id}, skip_conn=conn)
+        await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, "connected": True})
 
     try:
         while True:
@@ -108,47 +119,53 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 if to_conn_id:
                     target = hub.find_by_conn_id(room_key, to_conn_id)
                     if target:
-                        await target.ws.send_json(msg)
+                        try:
+                            await target.ws.send_json(msg)
+                        except Exception:
+                            # if target is dead, drop it
+                            await hub.disconnect(room_key, target)
                     continue
                 # else broadcast to room (clients filter)
                 await hub.broadcast(room_key, msg, skip_conn=conn)
             elif t == "state":
                 # update participant state and broadcast
-                db2 = SessionLocal()
-                try:
-                    p = db2.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
-                    if p:
-                        for f in ("mic_on", "cam_on", "screen_sharing", "is_speaking", "raised_hand"):
-                            if f in data:
-                                setattr(p, f, bool(data[f]))
-                        db2.commit()
-                    await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, **{k: data[k] for k in data if k != 'type'}})
-                finally:
-                    db2.close()
+                if not is_recorder:
+                    db2 = SessionLocal()
+                    try:
+                        p = db2.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
+                        if p:
+                            for f in ("mic_on", "cam_on", "screen_sharing", "is_speaking", "raised_hand"):
+                                if f in data:
+                                    setattr(p, f, bool(data[f]))
+                            db2.commit()
+                        await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, **{k: data[k] for k in data if k != 'type'}})
+                    finally:
+                        db2.close()
     except WebSocketDisconnect:
         await hub.disconnect(room_key, conn)
-        # mark disconnected in DB
-        db = SessionLocal()
-        try:
-            p = db.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
-            if p:
-                p.connected = False
-                db.commit()
-            # finish call log
-            key = (room_id, user_id)
-            log_id = hub.active_logs.pop(key, None)
-            if log_id:
-                cl = db.get(CallLog, log_id)
-                if cl and not cl.left_at:
-                    from datetime import datetime, timezone
-                    cl.left_at = datetime.now(timezone.utc)
-                    joined = cl.joined_at
-                    if joined is not None and joined.tzinfo is None:
-                        joined = joined.replace(tzinfo=timezone.utc)
-                    if joined is not None:
-                        cl.duration_seconds = int((cl.left_at - joined).total_seconds())
+        # mark disconnected in DB (skip for recorder)
+        if not is_recorder:
+            db = SessionLocal()
+            try:
+                p = db.query(Participant).filter(Participant.room_id == room_id, Participant.user_id == user_id).first()
+                if p:
+                    p.connected = False
                     db.commit()
-        finally:
-            db.close()
-        await hub.broadcast(room_key, {"type": "leave", "user_id": user_id, "conn_id": conn.conn_id})
-        await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, "connected": False})
+                # finish call log
+                key = (room_id, user_id)
+                log_id = hub.active_logs.pop(key, None)
+                if log_id:
+                    cl = db.get(CallLog, log_id)
+                    if cl and not cl.left_at:
+                        from datetime import datetime, timezone
+                        cl.left_at = datetime.now(timezone.utc)
+                        joined = cl.joined_at
+                        if joined is not None and joined.tzinfo is None:
+                            joined = joined.replace(tzinfo=timezone.utc)
+                        if joined is not None:
+                            cl.duration_seconds = int((cl.left_at - joined).total_seconds())
+                        db.commit()
+            finally:
+                db.close()
+            await hub.broadcast(room_key, {"type": "leave", "user_id": user_id, "conn_id": conn.conn_id})
+            await hub.broadcast(room_key, {"type": "participant_state", "user_id": user_id, "connected": False})
