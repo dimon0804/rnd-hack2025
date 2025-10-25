@@ -119,6 +119,15 @@ class RoomRecorder:
 
     async def make_offer(self, remote_conn_id: str):
         pc = await self.ensure_pc(remote_conn_id)
+        # Ensure we request media even before any remote SDP arrives
+        try:
+            # add recvonly transceivers once
+            if not getattr(pc, 'getTransceivers', None) or len(pc.getTransceivers()) == 0:
+                pc.addTransceiver('audio', direction='recvonly')
+                pc.addTransceiver('video', direction='recvonly')
+        except Exception:
+            # best-effort; continue to create offer
+            pass
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         await self.send_signal(remote_conn_id, {"sdp": {

@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from ..db.session import get_db
+from ..db.session import get_db, SessionLocal
 from ..models import Room, Participant, Recording, RecordingStatus
 from ..core.security import create_access_token
 from ..core.config import settings
@@ -49,6 +49,7 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
     db.add(rec)
     db.commit()
     db.refresh(rec)
+    rec_id = str(rec.id)
 
     # use owner's token to connect recorder as a participant
     service_token = create_access_token(str(me.id), extra={"display_name": me.display_name})
@@ -56,32 +57,48 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
 
     async def run():
         try:
-            rec.status = RecordingStatus.recording
-            db.commit()
-            await rr.start()
-            # after stop/finalize
-            rec.status = RecordingStatus.stopping
-            db.commit()
-            # upload to S3
-            with open(rr.output_path, "rb") as f:
-                key = f"recordings/{room_id}/{int(datetime.utcnow().timestamp())}.mkv"
-                url = upload_fileobj(f, key, content_type="video/x-matroska")
-            rec.public_url = url
-            rec.storage_key = key
-            rec.status = RecordingStatus.completed
-            rec.stopped_at = datetime.utcnow()
-            if rr.started_at:
-                rec.duration_seconds = int((rec.stopped_at - rr.started_at).total_seconds())
-            db.commit()
+            db2 = SessionLocal()
+            try:
+                rec2 = db2.get(Recording, rec_id)
+                if rec2:
+                    rec2.status = RecordingStatus.recording
+                    db2.commit()
+                await rr.start()
+                # after stop/finalize
+                rec2 = db2.get(Recording, rec_id)
+                if rec2:
+                    rec2.status = RecordingStatus.stopping
+                    db2.commit()
+                # upload to S3
+                with open(rr.output_path, "rb") as f:
+                    key = f"recordings/{room_id}/{int(datetime.utcnow().timestamp())}.mkv"
+                    url = upload_fileobj(f, key, content_type="video/x-matroska")
+                rec2 = db2.get(Recording, rec_id)
+                if rec2:
+                    rec2.public_url = url
+                    rec2.storage_key = key
+                    rec2.status = RecordingStatus.completed
+                    rec2.stopped_at = datetime.utcnow()
+                    if rr.started_at:
+                        rec2.duration_seconds = int((rec2.stopped_at - rr.started_at).total_seconds())
+                    db2.commit()
+            finally:
+                db2.close()
         except Exception:
-            rec.status = RecordingStatus.failed
-            db.commit()
+            db3 = SessionLocal()
+            try:
+                rec3 = db3.get(Recording, rec_id)
+                if rec3:
+                    rec3.status = RecordingStatus.failed
+                    db3.commit()
+            finally:
+                db3.close()
         finally:
             _recorders.pop(room_id, None)
 
     task = asyncio.create_task(run())
-    _recorders[room_id] = (task, rr, str(rec.id))
-    return {"status": "started", "recording_id": str(rec.id)}
+    _recorders[room_id] = (task, rr, rec_id)
+    return {"status": "started", "recording_id": rec_id}
 
 
 @router.post("/{room_id}/stop")

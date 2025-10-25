@@ -140,9 +140,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             if log_id:
                 cl = db.get(CallLog, log_id)
                 if cl and not cl.left_at:
-                    from datetime import datetime
-                    cl.left_at = datetime.utcnow()
-                    cl.duration_seconds = int((cl.left_at - cl.joined_at).total_seconds())
+                    from datetime import datetime, timezone
+                    cl.left_at = datetime.now(timezone.utc)
+                    joined = cl.joined_at
+                    if joined is not None and joined.tzinfo is None:
+                        joined = joined.replace(tzinfo=timezone.utc)
+                    if joined is not None:
+                        cl.duration_seconds = int((cl.left_at - joined).total_seconds())
                     db.commit()
         finally:
             db.close()

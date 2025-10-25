@@ -1,7 +1,32 @@
 # HackRTC API (Полная шпаргалка для фронта)
 
-Base URL: http://<host>:8000
+Base URL (local): http://<host>:8000
+Base URL (prod):  https://api-hack2025.clv-digital.tech
 Все ответы — JSON. Авторизация: `Authorization: Bearer <JWT>`.
+
+## Быстрый старт (prod)
+- **Проверка здоровья**
+  ```bash
+  curl -sS https://api-hack2025.clv-digital.tech/health
+  ```
+  Примечание: `HEAD` запрос (`curl -I`) может вернуть 405, используйте `GET`.
+- **Анонимная аутентификация**
+  ```bash
+  curl -sS -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"display_name":"Alice","avatar_url":"https://..."}' \
+    https://api-hack2025.clv-digital.tech/auth/anonymous
+  ```
+  Ответ: `{ "access_token": "<JWT>", "token_type": "bearer" }`
+- **Создание комнаты**
+  ```bash
+  TOKEN=<JWT>
+  curl -sS -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"Team call"}' \
+    https://api-hack2025.clv-digital.tech/rooms/
+  ```
 
 ## Аутентификация
 - `POST /auth/anonymous`
@@ -138,7 +163,8 @@ Base URL: http://<host>:8000
 ```
 
 ## WebSocket (сигналинг и состояния)
-- URL: `ws://<host>:8000/ws/{room_id}?token=<JWT>`
+- URL (local): `ws://<host>:8000/ws/{room_id}?token=<JWT>`
+- URL (prod):  `wss://api-hack2025.clv-digital.tech/ws/{room_id}?token=<JWT>`
 - От сервера:
   - `welcome`: `{ "type":"welcome","conn_id":"<uuid>" }`
   - `peers`: `{ "type":"peers","items":[{"user_id":"...","conn_id":"...","display_name":"..."}] }`
@@ -151,6 +177,16 @@ Base URL: http://<host>:8000
   - SDP/ICE (адресно): `{ "type":"signal","to_conn":"<target_conn_id>","sdp|ice":{...} }`
   - SDP (эфир): `{ "type":"signal","sdp":{...} }`
   - Состояния: `{ "type":"state", "mic_on":true|false, "cam_on":true|false, "screen_sharing":true|false, "is_speaking":true|false, "raised_hand":true|false }`
+
+### Пример подключения к WS (prod)
+```js
+const token = '<JWT>';
+const roomId = '<uuid>';
+const ws = new WebSocket(`wss://api-hack2025.clv-digital.tech/ws/${roomId}?token=${token}`);
+ws.onopen = () => console.log('ws open');
+ws.onmessage = (e) => console.log('ws message', e.data);
+ws.onclose = () => console.log('ws close');
+```
 
 ## Коды ответов
 - 200/201 — успех; 401 — неавторизован; 403 — нет прав; 404 — не найдено; 409 — конфликт (email занят); 422 — валидация.
