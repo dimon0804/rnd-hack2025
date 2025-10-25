@@ -67,26 +67,39 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
                 rec2 = db2.get(Recording, rec_id)
                 if rec2:
                     rec2.status = RecordingStatus.recording
+                    if not getattr(rec2, "started_at", None):
+                        rec2.started_at = datetime.utcnow()
                     db2.commit()
+                logger.info("recording.worker_started room_id=%s recording_id=%s", room_id, rec_id)
                 await rr.start()
                 # after stop/finalize
                 rec2 = db2.get(Recording, rec_id)
                 if rec2:
                     rec2.status = RecordingStatus.stopping
                     db2.commit()
-                # upload to S3
-                with open(rr.output_path, "rb") as f:
-                    key = f"recordings/{room_id}/{int(datetime.utcnow().timestamp())}.mkv"
-                    url = upload_fileobj(f, key, content_type="video/x-matroska")
+                # upload to S3 (if configured)
+                url = None
+                key = None
+                try:
+                    if settings.s3_bucket and settings.s3_endpoint and settings.s3_access_key and settings.s3_secret_key:
+                        with open(rr.output_path, "rb") as f:
+                            key = f"recordings/{room_id}/{int(datetime.utcnow().timestamp())}.mkv"
+                            url = upload_fileobj(f, key, content_type="video/x-matroska")
+                        logger.info("recording.uploaded room_id=%s recording_id=%s key=%s url=%s", room_id, rec_id, key, url)
+                    else:
+                        logger.warning("recording.s3_not_configured room_id=%s recording_id=%s path=%s", room_id, rec_id, rr.output_path)
+                except Exception:
+                    logger.exception("recording.upload_failed room_id=%s recording_id=%s path=%s", room_id, rec_id, rr.output_path)
                 rec2 = db2.get(Recording, rec_id)
                 if rec2:
                     rec2.public_url = url
                     rec2.storage_key = key
-                    rec2.status = RecordingStatus.completed
+                    rec2.status = RecordingStatus.completed if url or not settings.s3_bucket else RecordingStatus.failed
                     rec2.stopped_at = datetime.utcnow()
                     if rr.started_at:
                         rec2.duration_seconds = int((rec2.stopped_at - rr.started_at).total_seconds())
                     db2.commit()
+                logger.info("recording.worker_finished room_id=%s recording_id=%s status=%s", room_id, rec_id, rec2.status.value if rec2 else "unknown")
             finally:
                 db2.close()
         except Exception:
