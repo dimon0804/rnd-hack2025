@@ -114,6 +114,16 @@ class RoomRecorder:
             if ev:
                 await self.send_signal(remote_conn_id, {"ice": ev})
 
+        # Proactively request A/V to avoid offer without media
+        try:
+            pc.addTransceiver('audio', direction='recvonly')
+            pc.addTransceiver('video', direction='recvonly')
+        except Exception:
+            try:
+                pc.createDataChannel('rec')
+            except Exception:
+                pass
+
         self.pcs[remote_conn_id] = pc
         return pc
 
@@ -125,6 +135,9 @@ class RoomRecorder:
             if not getattr(pc, 'getTransceivers', None) or len(pc.getTransceivers()) == 0:
                 pc.addTransceiver('audio', direction='recvonly')
                 pc.addTransceiver('video', direction='recvonly')
+            # if still no transceivers (safety) ensure datachannel exists
+            if hasattr(pc, 'getTransceivers') and len(pc.getTransceivers()) == 0:
+                pc.createDataChannel('rec')
         except Exception:
             # best-effort; continue to create offer
             pass
