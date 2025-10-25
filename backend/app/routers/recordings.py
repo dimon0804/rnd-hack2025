@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
@@ -11,6 +12,7 @@ from .auth import get_current_user
 from ..lib.s3 import upload_fileobj
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # in-process recorder manager (per room)
 _recorders: dict[str, tuple[asyncio.Task, RoomRecorder, str]] = {}
@@ -53,10 +55,13 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
 
     # use owner's token to connect recorder as a participant
     service_token = create_access_token(str(me.id), extra={"display_name": me.display_name})
+    # create initial recorder instance and store reference for stop/status
     rr = RoomRecorder(room_id, service_token)
+    _recorders[room_id] = (None, rr, str(rec.id))  # type: ignore
 
     async def run():
         try:
+<<<<<<< HEAD
             db2 = SessionLocal()
             try:
                 rec2 = db2.get(Recording, rec_id)
@@ -93,12 +98,61 @@ async def start_recording(room_id: str, db: Session = Depends(get_db), authoriza
                     db3.commit()
             finally:
                 db3.close()
+=======
+            attempts = 0
+            max_attempts = 3
+            while attempts < max_attempts:
+                attempts += 1
+                # refresh recorder instance on each attempt and update registry for stop/status
+                rr_local = RoomRecorder(room_id, service_token)
+                _recorders[room_id] = (asyncio.current_task(), rr_local, str(rec.id))  # type: ignore
+                logger.info("recording.start attempt=%d room_id=%s recording_id=%s", attempts, room_id, rec.id)
+                rec.status = RecordingStatus.recording
+                db.commit()
+                try:
+                    await rr_local.start()
+                    break
+                except Exception as e:
+                    logger.exception("recording.worker_error room_id=%s recording_id=%s attempt=%d", room_id, rec.id, attempts)
+                    if attempts >= max_attempts:
+                        raise
+                    await asyncio.sleep(min(5 * attempts, 15))
+
+            # after stop/finalize
+            rec.status = RecordingStatus.stopping
+            db.commit()
+            # upload to S3
+            try:
+                # use the latest recorder stored in registry
+                _task, latest_rr, _rid = _recorders.get(room_id, (None, rr, str(rec.id)))  # type: ignore
+                with open(latest_rr.output_path, "rb") as f:
+                    key = f"recordings/{room_id}/{int(datetime.utcnow().timestamp())}.mkv"
+                    url = upload_fileobj(f, key, content_type="video/x-matroska")
+                rec.public_url = url
+                rec.storage_key = key
+                rec.status = RecordingStatus.completed
+                rec.stopped_at = datetime.utcnow()
+                if latest_rr.started_at:
+                    rec.duration_seconds = int((rec.stopped_at - latest_rr.started_at).total_seconds())
+                db.commit()
+                logger.info("recording.completed room_id=%s recording_id=%s url=%s", room_id, rec.id, rec.public_url)
+            except Exception:
+                logger.exception("recording.upload_failed room_id=%s recording_id=%s", room_id, rec.id)
+                rec.status = RecordingStatus.failed
+                db.commit()
+>>>>>>> 9e4f9cd74d1dc186bb1dcdc19b8c67d7fbd8ea87
         finally:
             _recorders.pop(room_id, None)
 
     task = asyncio.create_task(run())
+<<<<<<< HEAD
     _recorders[room_id] = (task, rr, rec_id)
     return {"status": "started", "recording_id": rec_id}
+=======
+    # update task reference in registry
+    _recorders[room_id] = (task, _recorders[room_id][1], str(rec.id))  # type: ignore
+    return {"status": "started", "recording_id": str(rec.id)}
+>>>>>>> 9e4f9cd74d1dc186bb1dcdc19b8c67d7fbd8ea87
 
 
 @router.post("/{room_id}/stop")
@@ -110,7 +164,12 @@ async def stop_recording(room_id: str, db: Session = Depends(get_db), authorizat
     if not entry:
         raise HTTPException(status_code=404, detail="Recording not running")
     task, rr, rec_id = entry
-    await rr.stop()
+    logger.info("recording.stop requested room_id=%s by user_id=%s recording_id=%s", room_id, me.id, rec_id)
+    try:
+        await rr.stop()
+    except Exception:
+        # stopping is best-effort
+        logger.exception("recording.stop_error room_id=%s recording_id=%s", room_id, rec_id)
     await task
     rec = db.get(Recording, rec_id)
     return {"status": rec.status.value if rec else "unknown", "recording_id": rec_id, "url": rec.public_url if rec else None}
@@ -133,3 +192,18 @@ async def list_recordings(room_id: str, db: Session = Depends(get_db), authoriza
         "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None,
         "duration_seconds": r.duration_seconds,
     } for r in recs]
+
+
+@router.get("/{room_id}/status")
+async def recording_status(room_id: str):
+    entry = _recorders.get(room_id)
+    if not entry:
+        return {"room_id": room_id, "running": False}
+    task, rr, rec_id = entry
+    return {
+        "room_id": room_id,
+        "running": not task.done(),
+        "recording_id": rec_id,
+        "started_at": rr.started_at.isoformat() if getattr(rr, "started_at", None) else None,
+        "output_path": rr.output_path,
+    }
